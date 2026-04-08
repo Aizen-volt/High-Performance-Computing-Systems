@@ -9,6 +9,7 @@
 #define TAG_WORK   0
 #define TAG_RESULT 1
 #define TAG_DONE   2
+#define CHUNK_SIZE 1000000  /* ~1MB sieve */
 
 /*
  * Result layout sent from slave to master (7 longs):
@@ -19,26 +20,18 @@
  *  [4] p_second       - is_prime(second value in chunk)
  *  [5] p_second_last  - is_prime(second-to-last value)
  *  [6] p_last         - is_prime(last value)
- *
- * Master resolves cross-boundary pairs between adjacent chunks A, B:
- *   - if A[5] && B[3] -> +1 pair   (A's 2nd-to-last, B's 1st)
- *   - if A[6] && B[4] -> +1 pair   (A's last, B's 2nd)
  */
 #define RES_FIELDS 7
 
-/*
- * Generate all primes up to limit using basic Sieve of Eratosthenes.
- * Returns malloc'd array of primes; sets *count to number found.
- * Caller must free the returned array.
- */
 static unsigned long *small_primes_up_to(unsigned long limit, long *count) {
-  char *mark = (char *)calloc(limit + 1, 1);
+  char *mark = (char *)calloc(limit + 1, 1);   /* 0 = prime */
   mark[0] = mark[1] = 1;
   for (unsigned long i = 2; i * i <= limit; i++)
     if (!mark[i])
       for (unsigned long j = i * i; j <= limit; j += i)
         mark[j] = 1;
 
+  /* Count and collect */
   long n = 0;
   for (unsigned long i = 2; i <= limit; i++)
     if (!mark[i]) n++;
@@ -53,26 +46,14 @@ static unsigned long *small_primes_up_to(unsigned long limit, long *count) {
   return primes;
 }
 
-/*
- * Process chunk covering indices [start, start+len).
- * Values are lo = start+1, lo+1, ..., lo+len-1  (i.e. start+len).
- *
- * Uses a sieve of Eratosthenes:
- *  1) Generate small primes up to sqrt(hi)
- *  2) Mark composites in the segment by crossing off multiples
- *  3) Scan the sieve for internal twin prime pairs
- *  4) Report boundary primality for master resolution
- */
 static void process_chunk(long start, long len, long result[RES_FIELDS]) {
   unsigned long lo = (unsigned long)(start + 1);
   unsigned long hi = (unsigned long)(start + len);
 
-  /* Step 1: small primes up to sqrt(hi) */
   unsigned long sqrt_hi = (unsigned long)sqrt((double)hi) + 1;
   long nprimes;
   unsigned long *sprimes = small_primes_up_to(sqrt_hi, &nprimes);
 
-  /* Step 2: segmented sieve — seg[i] = 0 means (lo + i) is prime */
   char *seg = (char *)calloc(len, 1);
 
   if (lo <= 1 && 1 - lo < (unsigned long)len)
@@ -81,13 +62,12 @@ static void process_chunk(long start, long len, long result[RES_FIELDS]) {
   for (long p = 0; p < nprimes; p++) {
     unsigned long pr = sprimes[p];
 
-    /* First multiple of pr that is >= lo and > pr itself */
     unsigned long first;
     if (pr * pr >= lo)
       first = pr * pr;
     else
       first = lo + ((pr - lo % pr) % pr);
-    if (first == pr) first += pr;  /* don't mark the prime itself */
+    if (first == pr) first += pr;
 
     for (unsigned long j = first; j <= hi; j += pr)
       seg[j - lo] = 1;
@@ -95,8 +75,6 @@ static void process_chunk(long start, long len, long result[RES_FIELDS]) {
 
   free(sprimes);
 
-  /* Step 3: count internal twin prime pairs.
-   * seg[i] and seg[i+2] correspond to values differing by 2. */
   long count = 0;
   for (long i = 0; i + 2 < len; i++)
     if (!seg[i] && !seg[i + 2])
@@ -114,7 +92,6 @@ static void process_chunk(long start, long len, long result[RES_FIELDS]) {
   free(seg);
 }
 
-/* Sort collected results by start index for boundary stitching */
 static int cmp_by_start(const void *a, const void *b) {
   long sa = ((const long *)a)[1];
   long sb = ((const long *)b)[1];
@@ -148,13 +125,29 @@ int main(int argc, char **argv) {
     int num_slaves = nproc - 1;
 
     if (num_slaves == 0) {
-      /* sequential fallback - single chunk, no boundaries */
-      long res[RES_FIELDS];
-      process_chunk(0, N, res);
-      total_twin_primes = res[0];
+      long chunk = CHUNK_SIZE;
+      if (chunk > N) chunk = N;
+
+      long prev_res[RES_FIELDS] = {0};
+      int have_prev = 0;
+
+      for (long pos = 0; pos < N; pos += chunk) {
+        long len = (pos + chunk <= N) ? chunk : (N - pos);
+        long res[RES_FIELDS];
+        process_chunk(pos, len, res);
+        total_twin_primes += res[0];
+
+        if (have_prev) {
+          if (prev_res[5] && res[3]) total_twin_primes++;
+          if (prev_res[6] && res[4]) total_twin_primes++;
+        }
+        memcpy(prev_res, res, RES_FIELDS * sizeof(long));
+        have_prev = 1;
+      }
     } else {
 
-      long chunk = N / (num_slaves * 20);
+      long chunk = CHUNK_SIZE;
+      if (chunk > N) chunk = N;
       if (chunk < 4) chunk = 4;
 
       long next = 0;
@@ -210,11 +203,9 @@ int main(int argc, char **argv) {
                      TAG_RESULT, MPI_COMM_WORLD, &recv_req);
       }
 
-      /* --- sum all internal counts --- */
       for (int i = 0; i < n_results; i++)
         total_twin_primes += all_results[i * RES_FIELDS + 0];
 
-      /* --- resolve cross-boundary pairs --- */
       qsort(all_results, n_results, RES_FIELDS * sizeof(long), cmp_by_start);
 
       for (int i = 0; i < n_results - 1; i++) {
